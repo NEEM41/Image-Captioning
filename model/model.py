@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from typing import Optional, Tuple
+import lightning as L
 
 
 @dataclass
@@ -299,13 +300,247 @@ class ClipLM(nn.Module):
             loss = F.cross_entropy(
                 text_logits[:, :-1, :].contiguous().view(-1, self.cfg.vocab_size),
                 labels[:, 1:].contiguous().view(-1),
-                ignore_index=-100,
+                ignore_index=self.cfg.pad_token,
                 reduction='mean'
             )
 
-        breakpoint()
-
         return logits, loss
+
+    @torch.no_grad()
+    def generate(
+        self,
+        clip_emb: torch.Tensor,                 # (B, clip_dim)
+        input_ids: torch.Tensor,                # (B, T) prompt tokens (e.g. BOS)
+        max_new_tokens: int = 32,
+        method: str = "greedy",                 # "greedy" or "topk"
+        temperature: float = 1.0,
+        top_k: int = 50,
+        eos_token_id: int | None = None,
+    ) -> torch.Tensor:
+        """
+        Autoregressive generation conditioned on CLIP pooled embedding.
+
+        Returns:
+            output_ids: (B, T + generated) token ids
+        """
+        self.eval()
+        device = next(self.parameters()).device
+        clip_emb = clip_emb.to(device)
+        input_ids = input_ids.to(device).long()
+
+        # Optional: sanity
+        if temperature <= 0:
+            raise ValueError("temperature must be > 0")
+
+        out = input_ids
+        for _ in range(max_new_tokens):
+            # Forward pass on current tokens
+            logits, _ = self(input_ids=out, clip_emb=clip_emb, labels=None)
+            # logits: (B, prefix_len + T, V) -> next token distribution at last position
+            next_logits = logits[:, -1, :]  # (B, V)
+
+            # Temperature
+            if temperature != 1.0:
+                next_logits = next_logits / temperature
+
+            if method == "greedy":
+                next_id = torch.argmax(next_logits, dim=-1, keepdim=True)  # (B,1)
+
+            elif method in ("topk", "top_k"):
+                k = int(top_k)
+                if k <= 0:
+                    # fallback to greedy if k is invalid
+                    next_id = torch.argmax(next_logits, dim=-1, keepdim=True)
+                else:
+                    # Top-k filtering
+                    topk_vals, topk_idx = torch.topk(next_logits, k, dim=-1)  # (B,k)
+                    probs = F.softmax(topk_vals, dim=-1)                      # (B,k)
+                    sample = torch.multinomial(probs, num_samples=1)         # (B,1)
+                    next_id = topk_idx.gather(-1, sample)                    # (B,1)
+            else:
+                raise ValueError(f"Unknown method='{method}'. Use 'greedy' or 'topk'.")
+
+            out = torch.cat([out, next_id], dim=1)
+
+            # Stop if eos generated for all sequences
+            if eos_token_id is not None:
+                if (next_id.squeeze(1) == eos_token_id).all():
+                    break
+
+        return out
+
+class ClipLMLightning(L.LightningModule):
+    def __init__(
+        self,
+        model,
+        lr: float = 3e-4,
+        min_lr: float = 3e-5,
+        weight_decay: float = 0.1,
+        betas=(0.9, 0.95),
+        warmup_steps: int = 0,
+        grad_clip_val: float = 1.0,
+        ignore_index: int = 8192,   # for token acc masking
+    ):
+        super().__init__()
+        self.model = model
+        self.save_hyperparameters(ignore=["model"])
+
+        self.lr = lr
+        self.min_lr = min_lr
+        self.weight_decay = weight_decay
+        self.betas = betas
+        self.warmup_steps = warmup_steps
+        self.grad_clip_val = grad_clip_val
+        self.ignore_index = ignore_index
+
+        self.model.train()
+
+    def forward(self, input_ids, clip_emb, labels=None):
+        return self.model(input_ids=input_ids, clip_emb=clip_emb, labels=labels)
+
+    @torch.no_grad()
+    def _token_accuracy(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """
+        logits: [B, prefix_len + T_text, V]
+        labels: [B, T_text]
+        """
+        ignore = self.ignore_index
+        T_text = labels.size(1)
+
+        # Take only the text positions from logits
+        logits_text = logits[:, -T_text:, :]   # [B, T_text, V]
+
+        # Next-token prediction: logits[t] predicts labels[t+1]
+        preds = logits_text[:, :-1, :].argmax(dim=-1)  # [B, T_text-1]
+        tgt   = labels[:, 1:]                           # [B, T_text-1]
+
+        mask = tgt.ne(ignore)
+        if mask.sum() == 0:
+            return torch.tensor(0.0, device=logits.device)
+
+        correct = (preds.eq(tgt) & mask).sum()
+        return correct.float() / mask.sum()
+
+    def training_step(self, batch, batch_idx):
+        input_ids = batch["input_ids"]
+        clip_emb = batch["clip_emb"]
+        labels = batch.get("labels", None)
+
+        # expect model returns (logits, loss) as in your code
+        logits, loss = self(input_ids=input_ids, clip_emb=clip_emb, labels=labels)
+
+        self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True,
+                 batch_size=input_ids.size(0))
+
+        # Token accuracy (only if labels exist)
+        if labels is not None and logits is not None:
+            acc = self._token_accuracy(logits, labels)
+            self.log("train_token_acc", acc, prog_bar=True, on_step=True, on_epoch=True,
+                     batch_size=input_ids.size(0))
+
+            pad_frac = (labels == self.ignore_index).float().mean()
+            self.log("train_pad_frac", pad_frac, on_step=True, on_epoch=True, batch_size=input_ids.size(0))
+
+        # Learning rate (log first param group; also log min/max if you want)
+        opt = self.optimizers(use_pl_optimizer=False)
+        if opt is not None:
+            lrs = [pg["lr"] for pg in opt.param_groups]
+            self.log("lr", lrs[0], prog_bar=False, on_step=True, on_epoch=False)
+            if len(lrs) > 1:
+                self.log("lr_min", min(lrs), on_step=True, on_epoch=False)
+                self.log("lr_max", max(lrs), on_step=True, on_epoch=False)
+
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        input_ids = batch["input_ids"]
+        clip_emb = batch["clip_emb"]
+        labels = batch.get("labels", None)
+
+        logits, loss = self(input_ids=input_ids, clip_emb=clip_emb, labels=labels)
+
+        self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True,
+                 batch_size=input_ids.size(0))
+
+        if labels is not None and logits is not None:
+            acc = self._token_accuracy(logits, labels)
+            self.log("val_token_acc", acc, prog_bar=True, on_step=False, on_epoch=True,
+                     batch_size=input_ids.size(0))
+            
+            pad_frac = (labels == self.ignore_index).float().mean()
+            self.log("val_pad_frac", pad_frac, on_step=False, on_epoch=True, batch_size=input_ids.size(0))
+
+        return loss
+
+    def on_before_optimizer_step(self, optimizer):
+        """
+        Called after backward() and before optimizer.step().
+        Great place to log grad norms. Works well with AMP (after unscale).
+        """
+        norms = []
+        for p in self.model.parameters():
+            if p.grad is None:
+                continue
+            norms.append(p.grad.detach().norm(2))
+
+        if len(norms) == 0:
+            return
+
+        norms = torch.stack(norms)  # [num_params_with_grad]
+        self.log("grad_norm_mean", norms.mean(), on_step=True, on_epoch=False, prog_bar=False)
+        self.log("grad_norm_max", norms.max(), on_step=True, on_epoch=False, prog_bar=False)
+
+        # optional: total norm (L2 over all grads)
+        total_norm = torch.linalg.vector_norm(norms, ord=2)
+        self.log("grad_norm_total", total_norm, on_step=True, on_epoch=False, prog_bar=False)
+
+    def configure_optimizers(self):
+        decay_params, no_decay_params = [], []
+        for name, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+            if name.endswith("bias") or "ln_" in name or "ln_f" in name or "LayerNorm" in name:
+                no_decay_params.append(p)
+            else:
+                decay_params.append(p)
+
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": decay_params, "weight_decay": self.weight_decay},
+                {"params": no_decay_params, "weight_decay": 0.0},
+            ],
+            lr=self.lr,
+            betas=self.betas,
+        )
+
+        if self.trainer is None:
+            return optimizer
+
+        total_steps = self.trainer.max_steps
+        if total_steps is None or total_steps <= 0:
+            total_steps = int(getattr(self.trainer, "estimated_stepping_batches", 0))
+        if total_steps <= 0:
+            return optimizer
+
+        warmup_steps = min(int(self.warmup_steps), total_steps)
+        base_lr = float(self.lr)
+        min_lr = float(self.min_lr)
+
+        def lr_lambda(step: int):
+            if step < warmup_steps:
+                return (step + 1) / max(1, warmup_steps)
+            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            progress = min(max(progress, 0.0), 1.0)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            lr = min_lr + (base_lr - min_lr) * cosine
+            return lr / base_lr
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1},
+        }
 
 if __name__ == '__main__':
     from dataset.dataset import ClipCaptionDataModule
@@ -327,12 +562,14 @@ if __name__ == '__main__':
     model = ClipLM(LMConfig())
     device = 'mps'
     model = model.to(device)
+    cliplm = ClipLMLightning(model).to(device)
+
 
     for batch in train_loader:
         input_ids = batch["input_ids"].to(device)   # must be on mps
         clip_emb  = batch["clip_emb"].to(device)    # must be on mps
         labels    = batch["labels"].to(device)      # must be on mps
-        output = model(input_ids=input_ids,
+        output = cliplm(input_ids=input_ids,
                        clip_emb=clip_emb,
                        labels=labels)
         breakpoint()

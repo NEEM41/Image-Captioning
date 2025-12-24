@@ -41,7 +41,7 @@ def collate_caption_batch(batch, pad_id: int, max_len: Optional[int] = None):
     T = max_len if max_len is not None else max(lengths)
 
     input_ids = torch.full((B, T), pad_id, dtype=torch.long)
-    labels = torch.full((B, T), -100, dtype=torch.long)  # ignore padding in CE
+    labels = torch.full((B, T), pad_id, dtype=torch.long)  # ignore padding in CE
 
     images = [b["image"] for b in batch]
 
@@ -100,8 +100,11 @@ class ClipPooledCaptionDataset(Dataset):
         # If you used: clip_pooled_train_shard_00000.safetensors
         # set shard_prefix="clip_pooled_train_shard_"
         # If val: shard_prefix="clip_pooled_val_shard_"
-        if shard_prefix is None:
-            shard_prefix = f"clip_pooled_{split}_shard_"
+        
+        # TODO: right now both got saved as train. Need to replace this not a big deal for now
+        shard_prefix = f"clip_pooled_train_shard_"
+        # if shard_prefix is None:
+        #     shard_prefix = f"clip_pooled_{split}_shard_"
         self.shard_prefix = shard_prefix
 
         self.df = pd.read_csv(self.csv_path)
@@ -251,12 +254,14 @@ class ClipCaptionDataModule(L.LightningDataModule):
         )
 
 if __name__ == '__main__':
+    from tqdm import tqdm 
+
     dm = ClipCaptionDataModule(
         train_csv="/Users/swornimchhetri/Desktop/all_codes/github_stuff/Image-Captioning/csvs/coco_train_tok.csv",
         val_csv="/Users/swornimchhetri/Desktop/all_codes/github_stuff/Image-Captioning/csvs/coco_val_tok.csv",
         embeddings_root="/Users/swornimchhetri/Desktop/all_codes/github_stuff/Image-Captioning/embeddings/pooled_clip_output",
         pad_id=8192,          # set to your tokenizer pad id
-        batch_size=64,
+        batch_size=1,
         max_len=69, # 69 Text + 8 prefix tokens
         num_workers=0,     # start with 0 on Mac
     )
@@ -265,5 +270,11 @@ if __name__ == '__main__':
 
     train_loader = dm.train_dataloader()
 
-    for batch in train_loader:
-        breakpoint()
+    # Check if all the dataset works as intended
+    max_len = 0
+    for batch in tqdm(train_loader):
+        max_len = max(max_len, batch['input_ids'].shape[1])
+
+    print(max_len) 
+
+        
