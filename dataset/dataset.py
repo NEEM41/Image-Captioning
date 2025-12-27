@@ -102,7 +102,9 @@ class ClipPooledCaptionDataset(Dataset):
         # If val: shard_prefix="clip_pooled_val_shard_"
         
         # TODO: right now both got saved as train. Need to replace this not a big deal for now
-        shard_prefix = f"clip_pooled_train_shard_"
+        # shard_prefix = f"clip_pooled_train_shard_"
+        shard_prefix = f"clip_lhs_train_shard_"
+
         # if shard_prefix is None:
         #     shard_prefix = f"clip_pooled_{split}_shard_"
         self.shard_prefix = shard_prefix
@@ -259,7 +261,7 @@ if __name__ == '__main__':
     dm = ClipCaptionDataModule(
         train_csv="/Users/swornimchhetri/Desktop/all_codes/github_stuff/Image-Captioning/csvs/coco_train_tok.csv",
         val_csv="/Users/swornimchhetri/Desktop/all_codes/github_stuff/Image-Captioning/csvs/coco_val_tok.csv",
-        embeddings_root="/Users/swornimchhetri/Desktop/all_codes/github_stuff/Image-Captioning/embeddings/pooled_clip_output",
+        embeddings_root="/Users/swornimchhetri/Desktop/all_codes/github_stuff/Image-Captioning/embeddings/token_embedding",
         pad_id=8192,          # set to your tokenizer pad id
         batch_size=1,
         max_len=69, # 69 Text + 8 prefix tokens
@@ -273,6 +275,7 @@ if __name__ == '__main__':
     # Check if all the dataset works as intended
     max_len = 0
     for batch in tqdm(train_loader):
+        breakpoint()
         max_len = max(max_len, batch['input_ids'].shape[1])
 
     print(max_len) 

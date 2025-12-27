@@ -51,6 +51,66 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+class CrossAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+
+        # Q from text, K/V from image
+        self.q_proj  = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.kv_proj = nn.Linear(config.n_embd, 2 * config.n_embd, bias=config.bias)
+
+        self.out_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+
+        self.flash = hasattr(F, "scaled_dot_product_attention")
+        if not self.flash:
+            print("WARNING: using slow attention (no flash SDPA).")
+
+    def forward(self, x, clip_proj):
+        """
+        x: (B, T, C)       text hidden states (decoder stream)
+        clip_proj: (B, N, C) image tokens projected to C (encoder memory)
+        """
+        B, T, C = x.size()
+        B2, N, C2 = clip_proj.size()
+        assert B == B2 and C == C2, f"Shape mismatch: x={x.shape}, clip_proj={clip_proj.shape}"
+
+        # Q from text
+        q = self.q_proj(x)  # (B, T, C)
+
+        # K,V from image
+        k, v = self.kv_proj(clip_proj).split(self.n_embd, dim=2)  # (B, N, C) each
+
+        # reshape to heads
+        hs = C // self.n_head
+        q = q.view(B, T, self.n_head, hs).transpose(1, 2)  # (B, nh, T, hs)
+        k = k.view(B, N, self.n_head, hs).transpose(1, 2)  # (B, nh, N, hs)
+        v = v.view(B, N, self.n_head, hs).transpose(1, 2)  # (B, nh, N, hs)
+
+        # Cross-attention: NOT causal
+        if self.flash:
+            y = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=False
+            )
+        else:
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(hs))  # (B, nh, T, N)
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ v  # (B, nh, T, hs)
+
+        y = y.transpose(1, 2).contiguous().view(B, T, C)  # (B, T, C)
+        y = self.resid_dropout(self.out_proj(y))
+        return y
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         """
@@ -145,9 +205,11 @@ class Block(nn.Module):
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.cross_attn = CrossAttention(config)
+        self.ln_3 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
+    def forward(self, x, img_tokens):
         """
         Run a transformer block step.
         Args:
@@ -157,7 +219,8 @@ class Block(nn.Module):
             Tensor of the same shape after attention and MLP residual updates.
         """
         x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        x = x + self.cross_attn(self.ln_2(x), img_tokens)
+        x = x + self.mlp(self.ln_3(x))
         return x
 
 class PositionalEmbedding(nn.Module):
@@ -211,11 +274,11 @@ class ClipLM(nn.Module):
         # language modeling head
         self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
 
-        # CLIP -> prefix projector: (B, clip_dim) -> (B, K*n_embd) -> (B, K, n_embd)
+        # CLIP -> model projector: (B, img_T, img_dim) -> (B, img_T, n_embd)
         self.clip_proj = nn.Sequential(
             nn.Linear(cfg.clip_dim, 2 * cfg.n_embd),
             nn.GELU(),
-            nn.Linear(2 * cfg.n_embd, cfg.prefix_len * cfg.n_embd),
+            nn.Linear(2 * cfg.n_embd, cfg.n_embd),
         )
 
         self.apply(self._init_weights)
@@ -254,7 +317,7 @@ class ClipLM(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,              # (B, T) text tokens
-        clip_emb: torch.Tensor,               # (B, clip_dim)
+        clip_emb: torch.Tensor,               # (B, T_img, img_dim)
         labels: Optional[torch.Tensor] = None # (B, T) text tokens (same as input_ids usually)
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
@@ -262,7 +325,7 @@ class ClipLM(nn.Module):
 
         Args:
             input_ids: LongTensor of shape (batch, text_len) with tokenized captions.
-            clip_emb: FloatTensor of shape (batch, clip_dim) containing pooled CLIP image embeddings.
+            clip_emb: FloatTensor of shape (batch, img_token_len, token_dim) containing last hidden state from clip.
             labels: Optional LongTensor matching input_ids for teacher forcing loss computation.
 
         Returns:
@@ -273,32 +336,29 @@ class ClipLM(nn.Module):
         assert T <= self.cfg.block_size, f"T={T} > block_size={self.cfg.block_size}"
 
         # build prefix embeddings
-        prefix = self.clip_proj(clip_emb).view(B, self.cfg.prefix_len, self.cfg.n_embd)  # (B,K,C)
+        # prefix = self.clip_proj(clip_emb).view(B, self.cfg.prefix_len, self.cfg.n_embd)  # (B,K,C)
+        clip_emb = clip_emb[:, 1:, :] # Remove CLS 
+        img_tokens = self.clip_proj(clip_emb) # (B, N, n_embd)
 
         # text token embeddings
-        tok = self.wte(input_ids)  # (B,T,C)
+        x = self.wte(input_ids)  # (B,T,C)
 
-        # concat: (B, K+T, C)
-        x = torch.cat([prefix, tok], dim=1)
         # adding positional encoding
         x = self.drop(x + self.pos_emb(x))
         TT = x.size(1)
 
         # transformer
         for blk in self.blocks:
-            x = blk(x)
+            x = blk(x, img_tokens)
         x = self.ln_f(x)
 
         logits = self.lm_head(x)  # (B, K+T, vocab)
 
         loss = None
         if labels is not None:
-            # Remove the prefix tokens
-            text_logits = logits[:, self.cfg.prefix_len:, :]  # (B,T,V)
-
             # input[:, :-1], labels[:, 1:] -> next token teacher forcing.
             loss = F.cross_entropy(
-                text_logits[:, :-1, :].contiguous().view(-1, self.cfg.vocab_size),
+                logits[:, :-1, :].contiguous().view(-1, self.cfg.vocab_size),
                 labels[:, 1:].contiguous().view(-1),
                 ignore_index=self.cfg.pad_token,
                 reduction='mean'
@@ -309,7 +369,7 @@ class ClipLM(nn.Module):
     @torch.no_grad()
     def generate(
         self,
-        clip_emb: torch.Tensor,                 # (B, clip_dim)
+        clip_emb: torch.Tensor,                 # (B, T_img, clip_dim)
         input_ids: torch.Tensor,                # (B, T) prompt tokens (e.g. BOS)
         max_new_tokens: int = 32,
         method: str = "greedy",                 # "greedy" or "topk"
@@ -548,7 +608,7 @@ if __name__ == '__main__':
     dm = ClipCaptionDataModule(
         train_csv="/Users/swornimchhetri/Desktop/all_codes/github_stuff/Image-Captioning/csvs/coco_train_tok.csv",
         val_csv="/Users/swornimchhetri/Desktop/all_codes/github_stuff/Image-Captioning/csvs/coco_val_tok.csv",
-        embeddings_root="/Users/swornimchhetri/Desktop/all_codes/github_stuff/Image-Captioning/embeddings/pooled_clip_output",
+        embeddings_root="/Users/swornimchhetri/Desktop/all_codes/github_stuff/Image-Captioning/embeddings/token_embedding",
         pad_id=8192,          # set to your tokenizer pad id
         batch_size=64,
         max_len=69,

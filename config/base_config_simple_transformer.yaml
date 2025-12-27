@@ -1,11 +1,11 @@
 # Run info
 run:
-  run_name: clip_prefix_simple_transformer
+  run_name: clip_prefix_simple_transformer_crossattn
   seed: 42
-  output_dir: ./runs/clip_prefix_simple_transformer
+  output_dir: ./runs/clip_prefix_simple_transformer_crossattn
   log_every_n_steps: 10
 
-# Model (ClipLM)
+# Model (ClipLM + Cross Attn)
 model_args:
   vocab_size: 8195
   block_size: 1024
@@ -20,7 +20,7 @@ model_args:
 
 # Dataset / DataModule
 data_args:
-  embeddings_root: /Users/swornimchhetri/Desktop/all_codes/github_stuff/Image-Captioning/embeddings/pooled_clip_output
+  embeddings_root: /Users/swornimchhetri/Desktop/all_codes/github_stuff/Image-Captioning/embeddings/token_embedding
   train_csv: /Users/swornimchhetri/Desktop/all_codes/github_stuff/Image-Captioning/csvs/coco_train_tok.csv
   val_csv: /Users/swornimchhetri/Desktop/all_codes/github_stuff/Image-Captioning/csvs/coco_val_tok.csv
   max_len: 69 # This is the max text tokens right now

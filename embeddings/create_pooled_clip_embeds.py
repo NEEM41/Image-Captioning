@@ -1,7 +1,8 @@
+import argparse
 import json
 import math
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import torch
 from PIL import Image
@@ -9,8 +10,20 @@ from tqdm import tqdm
 from transformers import AutoProcessor, CLIPVisionModel
 from safetensors.torch import save_file
 
+# -------------------------
+# CLI args (only pooled vs lhs)
+# -------------------------
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--embedding",
+    choices=["pooled", "lhs"],
+    required=True,
+    help="CLIP embedding type: pooled (pooler_output) or lhs (last_hidden_state)",
+)
+args = parser.parse_args()
+
 IMAGE_DIR = Path("/Users/swornimchhetri/Desktop/all_codes/github_stuff/coco/val2014")
-OUT_DIR = Path("/Users/swornimchhetri/Desktop/all_codes/github_stuff/Image-Captioning/embeddings/pooled_clip_output/val")
+OUT_DIR = Path("/Users/swornimchhetri/Desktop/all_codes/github_stuff/Image-Captioning/embeddings/token_embedding/val")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # -------------------------
@@ -18,7 +31,7 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 # -------------------------
 MODEL_NAME = "openai/clip-vit-base-patch32"
 BATCH_SIZE = 32           # 16–64 depending on MPS memory; 32 is usually safe
-SHARD_SIZE = 8192         # embeddings per shard (8192 -> ~12.5MB per shard in fp16)
+SHARD_SIZE = 8192         # embeddings per shard
 DTYPE_SAVE = torch.float16
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 
@@ -36,10 +49,13 @@ def chunked(lst: List[Path], n: int):
         yield lst[i:i + n]
 
 def shard_path(shard_idx: int) -> Path:
-    return OUT_DIR / f"clip_pooled_train_shard_{shard_idx:05d}.safetensors"
+    # keep your naming style; just reflect pooled vs lhs in the filename
+    tag = "pooled" if args.embedding == "pooled" else "lhs"
+    return OUT_DIR / f"clip_{tag}_train_shard_{shard_idx:05d}.safetensors"
 
 def shard_names_path(shard_idx: int) -> Path:
-    return OUT_DIR / f"clip_pooled_train_shard_{shard_idx:05d}_names.json"
+    tag = "pooled" if args.embedding == "pooled" else "lhs"
+    return OUT_DIR / f"clip_{tag}_train_shard_{shard_idx:05d}_names.json"
 
 def atomic_write_json(path: Path, obj) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -50,6 +66,8 @@ def main():
     print(f"Device: {DEVICE}")
     print(f"Image dir: {IMAGE_DIR}")
     print(f"Out dir:   {OUT_DIR}")
+    print(f"Model:     {MODEL_NAME}")
+    print(f"Embedding: {args.embedding}")
 
     # Load model + processor
     processor = AutoProcessor.from_pretrained(MODEL_NAME)
@@ -65,15 +83,15 @@ def main():
     print(f"Found {n} images -> {num_shards} shards (shard_size={SHARD_SIZE})")
 
     # Main index mapping filename -> (shard,row)
-    # Store only basename by default; if you have collisions, store relative path instead.
     index: Dict[str, Dict[str, int]] = {}
 
     # Metadata
     meta = {
         "model": MODEL_NAME,
         "device_used": DEVICE,
-        "embedding_type": "pooler_output",
+        "embedding_type": "pooler_output" if args.embedding == "pooled" else "last_hidden_state",
         "embedding_dim": None,   # filled after first batch
+        "num_tokens": None,      # only for last_hidden_state
         "dtype": str(DTYPE_SAVE).replace("torch.", ""),
         "batch_size": BATCH_SIZE,
         "shard_size": SHARD_SIZE,
@@ -81,7 +99,6 @@ def main():
         "image_dir": str(IMAGE_DIR),
     }
 
-    # Process shard-by-shard to keep RAM predictable
     global_i = 0
     shard_idx = 0
 
@@ -116,19 +133,27 @@ def main():
                 inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
 
                 outputs = model(**inputs)
-                pooled = outputs.pooler_output  # (B, 768 for ViT-B/32)
 
+                # --- THIS IS THE ONLY BEHAVIOR CHANGE ---
+                if args.embedding == "pooled":
+                    emb = outputs.pooler_output          # (B, 768)
+                else:
+                    emb = outputs.last_hidden_state      # (B, N, 768)
+
+                # fill meta once
                 if meta["embedding_dim"] is None:
-                    meta["embedding_dim"] = int(pooled.shape[-1])
+                    meta["embedding_dim"] = int(emb.shape[-1])
+                    if emb.dim() == 3:
+                        meta["num_tokens"] = int(emb.shape[1])
 
-                pooled_cpu = pooled.detach().to("cpu").to(DTYPE_SAVE)  # fp16 on disk
-                shard_emb_list.append(pooled_cpu)
+                emb_cpu = emb.detach().to("cpu").to(DTYPE_SAVE)
+                shard_emb_list.append(emb_cpu)
                 shard_names.extend(names)
 
             if not shard_emb_list:
                 raise RuntimeError(f"No embeddings produced for shard {shard_idx}")
 
-            shard_emb = torch.cat(shard_emb_list, dim=0)  # (N_shard_actual, D)
+            shard_emb = torch.cat(shard_emb_list, dim=0)
             assert shard_emb.shape[0] == len(shard_names)
 
             # Write shard safetensors
@@ -142,11 +167,9 @@ def main():
             # Update global index
             for row, name in enumerate(shard_names):
                 if name in index:
-                    # If you might have duplicate basenames, switch to relative paths instead of name.
                     raise RuntimeError(f"Duplicate filename key in index: {name}")
                 index[name] = {"shard": shard_idx, "row": row}
 
-            # advance
             global_i = shard_end
             shard_idx += 1
 

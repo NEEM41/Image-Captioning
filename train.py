@@ -297,10 +297,8 @@ def main():
         check_val_every_n_epoch=None,
     )
 
-    ckpt_path = "/Users/swornimchhetri/Desktop/all_codes/github_stuff/Image-Captioning/runs/clip_prefix_simple_transformer/mlruns/620745588439826271/57f341b3b26d4ac189bc98fbad69432a/artifacts/checkpoints/step0010000.ckpt"
-
     logger.log_hyperparams(cfg)
-    trainer.fit(model, datamodule=datamodule, ckpt_path=ckpt_path)
+    trainer.fit(model, datamodule=datamodule)
 
 
 if __name__ == "__main__":
